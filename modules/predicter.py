@@ -2,6 +2,7 @@ import numpy
 import opennsfw2
 from PIL import Image
 import cv2  # Add OpenCV import
+import threading
 import modules.globals  # Import globals to access the color correction toggle
 from modules.gpu_processing import gpu_cvt_color
 
@@ -10,6 +11,7 @@ from modules.typing import Frame
 MAX_PROBABILITY = 0.85
 
 # Preload the model once for efficiency
+_model_lock = threading.Lock()
 model = None
 
 def predict_frame(target_frame: Frame) -> bool:
@@ -20,8 +22,10 @@ def predict_frame(target_frame: Frame) -> bool:
     image = Image.fromarray(target_frame)
     image = opennsfw2.preprocess_image(image, opennsfw2.Preprocessing.YAHOO)
     global model
-    if model is None: 
-        model = opennsfw2.make_open_nsfw_model()
+    if model is None:
+        with _model_lock:
+            if model is None:
+                model = opennsfw2.make_open_nsfw_model()
         
     views = numpy.expand_dims(image, axis=0)
     _, probability = model.predict(views)[0]

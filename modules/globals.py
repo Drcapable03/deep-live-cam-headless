@@ -1,10 +1,13 @@
 # --- START OF FILE globals.py ---
 
+from __future__ import annotations
+
 import os
-from typing import List, Dict, Any
+import threading
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_DIR = os.path.join(ROOT_DIR, "workflow")
+dml_lock = threading.Lock()
 
 file_types = [
     ("Image", ("*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp")),
@@ -88,13 +91,25 @@ stream_fps: int = 30
 stream_quality: int = 23
 # Stream encoder: 'libx264', 'h264_nvenc', 'copy'
 stream_encoder: str = 'libx264'
-# Enable stream output even when running with UI
-stream_while_live: bool = False
+# Resolution decoupling (Phase 1): face detection/swap/enhance run at this
+# reduced resolution, then the result is upscaled to stream_size. 0 = auto.
+# Default auto rule (headless_live): process at the input resolution, capped
+# at 854x480 (the FACELESS 480p sweet spot — inswapper warp + GPEN cost
+# scale with input resolution, not model size).
+process_width: int = 0
+process_height: int = 0
+# Phase 2: virtual camera output + audio passthrough
+virtual_cam_name: str | None = None
+stream_audio_source: str | None = None
+# Phase 3: FP16 acceleration, post-processing, quality presets, adaptive res
+fp16: bool = True                       # FP16 models on CUDA Tensor-Core GPUs
+sharpen_strength: float = 0.0           # 0-1+ unsharp strength on swapped faces
+blend_opacity: float = 1.0              # 0-1 blend swapped face over original
+quality_preset: str = "normal"          # 'normal' | 'high' (bundled defaults)
+adaptive_resolution: bool = False       # auto-degrade process res to hold fps
+adaptive_scale: float = 1.0             # current adaptive resolution scale
 # Named pipe path for raw frame output (alternative to RTMP)
 pipe_output_path: str | None = None
 # --- END: Added for Headless Streaming ---
 
 # --- END OF FILE globals.py ---
-
-import threading
-dml_lock = threading.Lock()

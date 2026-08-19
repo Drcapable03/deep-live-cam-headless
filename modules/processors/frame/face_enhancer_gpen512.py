@@ -1,6 +1,7 @@
 """GPEN-BFR-512 face enhancer -- ONNX-based face restoration at 512x512."""
 
-from typing import Any, List
+from __future__ import annotations
+
 import os
 import threading
 
@@ -21,7 +22,7 @@ from modules.processors.frame._onnx_enhancer import (
 
 NAME = "DLC.FACE-ENHANCER-GPEN512"
 INPUT_SIZE = 512
-MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-512.onnx"
+MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/Models/GPEN-BFR-512.onnx"
 MODEL_FILE = "GPEN-BFR-512.onnx"
 
 ENHANCER = None
@@ -66,24 +67,32 @@ def get_enhancer() -> Any:
     return ENHANCER
 
 
-def enhance_face(temp_frame: Frame, face: Face) -> Frame:
+def enhance_face(temp_frame: Frame, face: Face, temporal: bool = False) -> Frame:
     try:
         session = get_enhancer()
     except Exception as e:
         print(f"{NAME}: {e}")
         return temp_frame
     try:
-        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE)
+        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE, temporal=temporal)
     except Exception as e:
         print(f"{NAME}: Error during face enhancement: {e}")
         return temp_frame
 
 
-def process_frame(source_face: Face | None, temp_frame: Frame) -> Frame:
-    target_face = get_one_face(temp_frame)
+def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=None) -> Frame:
+    if detected_faces:
+        if isinstance(detected_faces, list) and len(detected_faces) > 0:
+            target_face = detected_faces[0]
+        else:
+            target_face = detected_faces
+    else:
+        target_face = get_one_face(temp_frame)
     if target_face is None:
         return temp_frame
-    return enhance_face(temp_frame, target_face)
+    # Temporal caching only for a single tracked face in live mode
+    temporal = detected_faces is not None and not getattr(modules.globals, "many_faces", False)
+    return enhance_face(temp_frame, target_face, temporal=temporal)
 
 
 def process_frame_v2(temp_frame: Frame) -> Frame:

@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import sys
+import os
 import time
 from typing import Optional, Tuple, Callable
 import platform
@@ -179,8 +180,6 @@ class VideoCapturer:
 
     def _start_pipe(self, width: int, height: int) -> bool:
         """Initialize named pipe capture."""
-        import os
-
         pipe_path = self.source[5:] if self.source.lower().startswith("pipe:") else self.source
         self._pipe_fd = None
 

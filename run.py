@@ -25,11 +25,12 @@ if sys.platform == "win32":
                     os.environ["PATH"] = _bin_dir + os.pathsep + os.environ["PATH"]
 
 # Only import tkinter fix when not in headless mode.
-# Headless mode is detected by --input-source, --headless, or -s/-t/-o arguments.
+_headless_args = {'--input-source', '--headless'}
+_source_args = {'-s', '--source', '-t', '--target', '-o', '--output'}
 _needs_tkinter = True
-if any(arg in sys.argv for arg in ('--input-source', '--headless')):
+if any(arg in sys.argv for arg in _headless_args):
     _needs_tkinter = False
-if any(arg.startswith(('-s', '--source', '-t', '--target', '-o', '--output')) for arg in sys.argv):
+if any(arg.startswith(tuple(_source_args)) for arg in sys.argv):
     _needs_tkinter = False
 
 if _needs_tkinter:

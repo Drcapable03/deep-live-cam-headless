@@ -19,6 +19,9 @@ from modules.face_analyser import (
     get_many_faces,
     detect_one_face_fast,
     detect_many_faces_fast,
+    get_one_face_lite,
+    get_many_faces_lite,
+    _needs_landmark,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     add_blank_map,
@@ -453,7 +456,8 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     def on_transparency_change(value: float):
         # Convert slider value to float
         val = float(value)
-        modules.globals.opacity = val  # Set global opacity
+        modules.globals.opacity = val  # Set global opacity (legacy name)
+        modules.globals.blend_opacity = val  # Phase 3 canonical name
         percentage = int(val * 100)
 
         if percentage == 0:
@@ -491,6 +495,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     sharpness_var = ctk.DoubleVar(value=0.0)  # start at 0.0
     def on_sharpness_change(value: float):
         modules.globals.sharpness = float(value)
+        modules.globals.sharpen_strength = float(value)  # Phase 3 canonical name
         update_status(f"Sharpness set to {value:.1f}")
 
     sharpness_label = ctk.CTkLabel(root, text="Sharpness:")
@@ -768,12 +773,6 @@ def update_pop_live_status(text: str) -> None:
 def update_tumbler(var: str, value: bool) -> None:
     modules.globals.fp_ui[var] = value
     save_switch_states()
-    # If we're currently in a live preview, update the frame processors
-    if PREVIEW.state() == "normal":
-        global frame_processors
-        frame_processors = get_frame_processors_modules(
-            modules.globals.frame_processors
-        )
 
 
 def fetch_random_face() -> None:
@@ -1140,14 +1139,22 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
             # Run detection every det_interval frames (~80ms).
-            # Use fast detection (det-only, no landmark/recognition) for live mode.
+            # When masks or enhancers are active, use landmark-aware lite
+            # detection (skips recognition) — masks silently no-op'd before.
             det_count += 1
+            need_landmarks = _needs_landmark()
             if det_count % det_interval == 0:
                 if modules.globals.many_faces:
                     cached_target_face = None
-                    cached_many_faces = detect_many_faces_fast(temp_frame)
+                    if need_landmarks:
+                        cached_many_faces = get_many_faces_lite(temp_frame, need_landmark=True)
+                    else:
+                        cached_many_faces = detect_many_faces_fast(temp_frame)
                 else:
-                    cached_target_face = detect_one_face_fast(temp_frame)
+                    if need_landmarks:
+                        cached_target_face = get_one_face_lite(temp_frame, need_landmark=True)
+                    else:
+                        cached_target_face = detect_one_face_fast(temp_frame)
                     cached_many_faces = None
 
             # Build face list for enhancers from cached detection

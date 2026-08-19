@@ -1,0 +1,44 @@
+============================================================
+Deep-Live-Cam Headless Smoke Test (Phase 1/2)
+Source: face.jpg | Target: smoke_input.mp4 | Provider: cpu
+============================================================
+[TEST] Imports
+[TEST] Global/CLI wiring
+[PASS] process_width present
+[PASS] process_height present
+[PASS] virtual_cam_name present
+[PASS] stream_audio_source present
+[TEST] Output creation
+[PASS] file output created
+[PASS] virtualcam object created
+[PASS] virtualcam start (driver present)
+[TEST] Landmark-aware detection
+  source face bbox: [363.05145 331.73196 685.2991  799.4511 ]
+[PASS] source face loaded
+[PASS] landmarks present (masks on)
+[PASS] recognition skipped in lite mode
+[TEST] Phase 3 wiring
+[PASS] fp16 global present
+[PASS] blend_opacity global present
+[PASS] sharpen_strength global present
+[PASS] quality_preset global present
+[PASS] adaptive_resolution global present
+[PASS] fp16 disabled without CUDA EP
+[PASS] fp16 returns None on CPU (no conversion)
+[PASS] fp16 model file cached for GPU boxes
+[PASS] preset high + explicit flags win  ({'PW': '960', 'PH': '540', 'FP': "['face_swapper', 'face_enhancer_gpen256']", 'BO': '0.8', 'SS': '0.5', 'FP16': 'False', 'AR': 'True', 'QP': 'high'})
+[PASS] preset normal keeps defaults  ({'PW': '0', 'PH': '0', 'FP': "['face_swapper']", 'BO': '1.0', 'SS': '0.0', 'FP16': 'True', 'AR': 'False', 'QP': 'normal'})
+[TEST] End-to-end pipeline
+[PASS] pipeline start
+[PASS] frames processed  (processed=8 target=8)
+[PASS] mask sizes unchanged after run
+[PASS] sharpen + opacity globals hold
+  stats: captured=3358 processed=8 written=8 fps=0.1
+[PASS] output file valid (video stream)  (['Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 1280x720, 2981 kb/s, 30 fps, 30 tbr, 15360 tbn (default)'])
+[PASS] silent input stays silent  (input_audio=False output_audio=False)
+
+============================================================
+Smoke Test Summary
+============================================================
+  25/25 checks passed
+RESULT: PASS

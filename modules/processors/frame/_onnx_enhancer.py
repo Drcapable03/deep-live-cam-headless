@@ -4,10 +4,11 @@ Provides session creation, pre/post processing, and the core
 enhance-face-via-ONNX pipeline.
 """
 
+from __future__ import annotations
+
 import os
 import platform
 import threading
-from typing import Any
 
 import cv2
 import numpy as np
@@ -19,6 +20,19 @@ IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm6
 
 # Limit concurrent ONNX calls to avoid VRAM exhaustion on multi-face frames
 THREAD_SEMAPHORE = threading.Semaphore(min(max(1, (os.cpu_count() or 1)), 8))
+
+# Temporal enhancement cache for live mode (ported from face_enhancer.py).
+# The enhanced face and its inverse affine barely change between
+# consecutive frames (same face, same pose), so we run inference every
+# _ENH_INTERVAL frames and reuse the cached enhanced face + inverse
+# affine for the paste-back in between.  Cuts GPEN cost by ~50%.
+_enh_live_cache: dict = {
+    'enhanced': None,
+    'inv_M': None,
+    'input_size': 0,
+    'frame_count': 0,
+}
+_ENH_INTERVAL = 2
 
 
 def build_provider_config():
@@ -34,8 +48,18 @@ def build_provider_config():
 
 
 def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
-    """Create an ONNX Runtime session using the configured execution providers."""
+    """Create an ONNX Runtime session using the configured execution providers.
+
+    When FP16 is enabled and the model is FP32, prefers a cached FP16
+    conversion (one-time, automatic) — GPEN-BFR on Tensor Cores runs
+    ~2x faster at FP16 with negligible quality loss.
+    """
     providers = modules.globals.execution_providers
+    if getattr(modules.globals, "fp16", True):
+        from modules.onnx_fp16 import get_fp16_model_path
+        fp16_path = get_fp16_model_path(model_path)
+        if fp16_path:
+            model_path = fp16_path
     session = onnxruntime.InferenceSession(model_path, providers=providers)
     return session
 
@@ -117,21 +141,49 @@ def enhance_face_onnx(
     face: Any,
     session: onnxruntime.InferenceSession,
     input_size: int,
+    temporal: bool = False,
 ) -> np.ndarray:
-    """Enhance a single face in the frame using an ONNX face restoration model."""
-    M, inv_M = _get_face_affine(face, input_size)
-    if M is None:
-        return frame
+    """Enhance a single face in the frame using an ONNX face restoration model.
 
-    face_crop = cv2.warpAffine(
-        frame, M, (input_size, input_size),
-        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
-    )
+    Args:
+        temporal: When True, cache the enhanced face + inverse affine and
+            only run inference every _ENH_INTERVAL frames (live mode).
+            Must only be used for a single tracked face (not many_faces).
+    """
+    if temporal:
+        _enh_live_cache['frame_count'] += 1
+        run_inference = (_enh_live_cache['frame_count'] % _ENH_INTERVAL == 0
+                         or _enh_live_cache['enhanced'] is None)
+    else:
+        run_inference = True
 
-    blob = preprocess_face(face_crop, input_size)
-    with THREAD_SEMAPHORE:
-        output = session.run(None, {session.get_inputs()[0].name: blob})[0]
-    enhanced = postprocess_face(output)
+    if run_inference:
+        M, inv_M = _get_face_affine(face, input_size)
+        if M is None:
+            return frame
+
+        face_crop = cv2.warpAffine(
+            frame, M, (input_size, input_size),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        blob = preprocess_face(face_crop, input_size)
+        with THREAD_SEMAPHORE:
+            output = session.run(None, {session.get_inputs()[0].name: blob})[0]
+        enhanced = postprocess_face(output)
+
+        if temporal:
+            _enh_live_cache['enhanced'] = enhanced
+            _enh_live_cache['inv_M'] = inv_M
+            _enh_live_cache['input_size'] = input_size
+    else:
+        # Reuse the cached enhanced face — just paste it back
+        cached = _enh_live_cache
+        if cached['enhanced'] is None:
+            return frame
+        enhanced = cached['enhanced']
+        inv_M = cached['inv_M']
+        input_size = cached['input_size']
 
     # Create mask for blending (feathered edges)
     mask = np.ones((input_size, input_size), dtype=np.float32)

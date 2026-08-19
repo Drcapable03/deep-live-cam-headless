@@ -258,6 +258,53 @@ def create_eyebrows_mask(face: Face, frame: Frame):
     return mask, eyebrows_cutout, eyebrows_box, eyebrows_polygon
 
 
+def draw_mouth_mask_visualization(
+    frame: Frame, face: Face, mouth_mask_data: tuple
+) -> Frame:
+    """Debug overlay that draws the mouth-mask box and polygon on a frame copy."""
+    if frame is None or face is None or mouth_mask_data is None or len(mouth_mask_data) != 4:
+        return frame
+
+    mask, mouth_cutout, box, lower_lip_polygon = mouth_mask_data
+    (min_x, min_y, max_x, max_y) = box
+
+    if lower_lip_polygon is None or not isinstance(lower_lip_polygon, np.ndarray) or len(lower_lip_polygon) < 3:
+        return frame
+
+    vis_frame = frame.copy()
+    height, width = vis_frame.shape[:2]
+
+    try:
+        min_x, min_y = max(0, int(min_x)), max(0, int(min_y))
+        max_x, max_y = min(width, int(max_x)), min(height, int(max_y))
+    except (ValueError, TypeError):
+        return frame
+
+    if max_x <= min_x or max_y <= min_y:
+        return frame
+
+    try:
+        safe_polygon = lower_lip_polygon.copy()
+        safe_polygon[:, 0] = np.clip(safe_polygon[:, 0], 0, width - 1)
+        safe_polygon[:, 1] = np.clip(safe_polygon[:, 1], 0, height - 1)
+        cv2.polylines(vis_frame, [safe_polygon.astype(np.int32)], isClosed=True,
+                      color=(0, 255, 0), thickness=2)
+    except Exception:
+        pass
+
+    cv2.rectangle(vis_frame, (min_x, min_y), (max_x, max_y), (0, 0, 255), 2)
+
+    label_pos_y = min_y - 10 if min_y > 20 else max_y + 15
+    label_pos_x = min_x
+    try:
+        cv2.putText(vis_frame, "Mouth Mask", (label_pos_x, label_pos_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    except Exception:
+        pass
+
+    return vis_frame
+
+
 def apply_mask_area(
     frame: np.ndarray,
     cutout: np.ndarray,
@@ -320,10 +367,10 @@ def apply_mask_area(
             color_corrected_area * combined_mask_3ch + roi * inv_mask
         ).astype(np.uint8)
 
-        # Apply face mask to blended result
+        # Apply face mask to blended result (np.copy to avoid read-only view from broadcast_to)
         face_mask_f32 = face_mask_roi[:, :, np.newaxis].astype(
             np.float32) * np.float32(1.0 / 255.0)
-        face_mask_3channel = np.broadcast_to(face_mask_f32, blended.shape)
+        face_mask_3channel = np.broadcast_to(face_mask_f32, blended.shape).copy()
         final_blend = blended * face_mask_3channel + roi * (
             np.float32(1.0) - face_mask_3channel)
 

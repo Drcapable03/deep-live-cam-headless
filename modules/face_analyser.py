@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import os
 import shutil
-from typing import Any
 import insightface
 import threading
 
@@ -91,10 +92,14 @@ def _optimize_det_model(fa: Any, providers) -> None:
 def _needs_landmark() -> bool:
     """Check whether any active feature requires 106-point landmarks.
 
-    Landmarks are needed by face enhancers and mouth masking, but not
-    by the face swapper alone.
+    Landmarks are needed by face enhancers and all feature-preservation
+    masks (mouth/eyes/eyebrows), but not by the face swapper alone.
     """
-    if getattr(modules.globals, "mouth_mask", False):
+    if getattr(modules.globals, "mouth_mask", False) or getattr(modules.globals, "mouth_mask_size", 0.0) > 0:
+        return True
+    if getattr(modules.globals, "eyes_mask", False) or getattr(modules.globals, "eyes_mask_size", 0.0) > 0:
+        return True
+    if getattr(modules.globals, "eyebrows_mask", False) or getattr(modules.globals, "eyebrows_mask_size", 0.0) > 0:
         return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in
@@ -186,6 +191,61 @@ def detect_many_faces_fast(frame: Frame) -> Any:
             for i in range(bboxes.shape[0])]
 
 
+def _analyse_faces_lite(frame: Frame, need_landmark: bool = True) -> list:
+    """Detection + optional 106-point landmarks, skipping recognition.
+
+    The face swapper only needs bbox + kps for the warp, and the
+    feature-preservation masks need landmark_2d_106.  Recognition
+    (normed_embedding) is unnecessary for the live path and costs
+    ~1-2ms per face, so we skip it here.
+    """
+    fa = get_face_analyser()
+
+    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric="default")
+    if bboxes.shape[0] == 0:
+        return []
+
+    lmk_model = fa.models.get("landmark_2d_106") if need_landmark else None
+
+    from insightface.app.common import Face
+
+    faces = []
+    for i in range(bboxes.shape[0]):
+        face = Face(bbox=bboxes[i, 0:4],
+                    kps=kpss[i] if kpss is not None else None,
+                    det_score=bboxes[i, 4])
+        if lmk_model is not None:
+            lmk_model.get(frame, face)
+        faces.append(face)
+
+    return faces
+
+
+def get_one_face_lite(frame: Frame, need_landmark: bool = True) -> Any:
+    """Detection (+ optional landmarks) for the left-most face, no recognition."""
+    if _is_dml():
+        with modules.globals.dml_lock:
+            faces = _analyse_faces_lite(frame, need_landmark)
+    else:
+        faces = _analyse_faces_lite(frame, need_landmark)
+    try:
+        return min(faces, key=lambda x: x.bbox[0])
+    except ValueError:
+        return None
+
+
+def get_many_faces_lite(frame: Frame, need_landmark: bool = True) -> Any:
+    """Multi-face detection (+ optional landmarks), no recognition."""
+    try:
+        if _is_dml():
+            with modules.globals.dml_lock:
+                return _analyse_faces_lite(frame, need_landmark)
+        else:
+            return _analyse_faces_lite(frame, need_landmark)
+    except IndexError:
+        return None
+
+
 def has_valid_map() -> bool:
     for map in modules.globals.source_target_map:
         if "source" in map and "target" in map:
@@ -229,7 +289,11 @@ def get_unique_faces_from_target_image() -> Any:
         i = 0
 
         for face in many_faces:
-            x_min, y_min, x_max, y_max = face['bbox']
+            try:
+                bbox = face.bbox if hasattr(face, 'bbox') else face.get('bbox', [0, 0, 0, 0])
+            except Exception:
+                bbox = face.get('bbox', [0, 0, 0, 0]) if isinstance(face, dict) else [0, 0, 0, 0]
+            x_min, y_min, x_max, y_max = bbox
             modules.globals.source_target_map.append({
                 'id' : i, 
                 'target' : {
@@ -252,7 +316,9 @@ def get_unique_faces_from_target_video() -> Any:
         clean_temp(modules.globals.target_path)
         create_temp(modules.globals.target_path)
         print('Extracting frames...')
-        extract_frames(modules.globals.target_path)
+        if not extract_frames(modules.globals.target_path):
+            print(f"ERROR: Frame extraction failed for {modules.globals.target_path}")
+            return None, []
 
         temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
 
@@ -307,7 +373,7 @@ def default_target_face():
                     best_face = face
                     best_frame = frame
 
-        x_min, y_min, x_max, y_max = best_face['bbox']
+        x_min, y_min, x_max, y_max = best_face.bbox if hasattr(best_face, 'bbox') else best_face.get('bbox', [0, 0, 0, 0])
 
         target_frame = cv2.imread(best_frame['location'])
         map['target'] = {
@@ -330,7 +396,11 @@ def dump_faces(centroids: Any, frame_face_embeddings: list):
             j = 0
             for face in frame['faces']:
                 if face['target_centroid'] == i:
-                    x_min, y_min, x_max, y_max = face['bbox']
+                    try:
+                        bbox = face.bbox if hasattr(face, 'bbox') else face.get('bbox', [0, 0, 0, 0])
+                    except Exception:
+                        bbox = face.get('bbox', [0, 0, 0, 0]) if isinstance(face, dict) else [0, 0, 0, 0]
+                    x_min, y_min, x_max, y_max = bbox
 
                     if temp_frame[int(y_min):int(y_max), int(x_min):int(x_max)].size > 0:
                         cv2.imwrite(temp_directory_path + f"/{i}/{frame['frame']}_{j}.png", temp_frame[int(y_min):int(y_max), int(x_min):int(x_max)])

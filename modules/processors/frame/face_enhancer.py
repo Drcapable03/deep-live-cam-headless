@@ -1,6 +1,7 @@
 # Uses ONNX Runtime for GFPGAN face enhancement (no torch/gfpgan dependency)
 
-from typing import Any, List
+from __future__ import annotations
+
 import cv2
 import threading
 import numpy as np
@@ -19,7 +20,7 @@ from modules.utilities import (
 )
 
 FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()
+THREAD_SEMAPHORE = threading.Semaphore(8)
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-ENHANCER"
 

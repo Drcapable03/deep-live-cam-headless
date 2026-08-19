@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import glob
 import mimetypes
 import os
@@ -7,7 +9,6 @@ import ssl
 import subprocess
 import urllib
 from pathlib import Path
-from typing import List, Any
 from tqdm import tqdm
 
 import modules.globals
@@ -61,20 +62,23 @@ def detect_fps(target_path: str) -> float:
     return 30.0
 
 
-def extract_frames(target_path: str) -> None:
+def extract_frames(target_path: str) -> bool:
     """Extract frames with hardware acceleration and optimized settings."""
     temp_directory_path = get_temp_directory_path(target_path)
     
     # Write a contiguous image sequence so the later "%04d.png" input pattern
     # used during encoding can consume every frame reliably.
-    run_ffmpeg(
+    if not run_ffmpeg(
         [
             "-i", target_path,
             "-vf", "format=rgb24",  # Use video filter for format conversion (faster)
             "-vsync", "0",  # Prevent frame duplication
             os.path.join(temp_directory_path, "%04d.png"),
         ]
-    )
+    ):
+        print(f"ERROR: Frame extraction failed for {target_path}")
+        return False
+    return True
 
 
 def create_video(target_path: str, fps: float = 30.0) -> bool:
@@ -190,7 +194,7 @@ def create_video(target_path: str, fps: float = 30.0) -> bool:
     return success and os.path.isfile(temp_output_path)
 
 
-def restore_audio(target_path: str, output_path: str) -> None:
+def restore_audio(target_path: str, output_path: str) -> bool:
     temp_output_path = get_temp_output_path(target_path)
     done = run_ffmpeg(
         [
@@ -208,8 +212,9 @@ def restore_audio(target_path: str, output_path: str) -> None:
             output_path,
         ]
     )
-    if not done:
+    if not done or not os.path.isfile(output_path):
         move_temp(target_path, output_path)
+    return os.path.isfile(output_path)
 
 
 def get_temp_frame_paths(target_path: str) -> List[str]:

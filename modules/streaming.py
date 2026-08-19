@@ -9,6 +9,8 @@ Handles:
 This module is designed to work without any GUI or display server.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import cv2
@@ -17,7 +19,6 @@ import subprocess
 import threading
 import queue
 import time
-from typing import Optional, Callable, Tuple, Generator
 from pathlib import Path
 
 import modules.globals
@@ -230,7 +231,7 @@ class FFmpegInputSource(FrameSource):
 
         try:
             self.process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             # Quick test read to verify it's working
             print(f"[STREAMING] FFmpeg input started from: {self.url}")
@@ -335,13 +336,15 @@ class FFmpegStreamOutput(StreamOutput):
     """
 
     def __init__(self, url: str, width: int = 1280, height: int = 720,
-                 fps: int = 30, encoder: str = "libx264", quality: int = 23):
+                 fps: int = 30, encoder: str = "libx264", quality: int = 23,
+                 audio_source: Optional[str] = None):
         self.url = url
         self.width = width
         self.height = height
         self.fps = fps
         self.encoder = encoder
         self.quality = quality
+        self.audio_source = audio_source
         self.process: Optional[subprocess.Popen] = None
         self._frame_size = width * height * 3
         self._stderr_thread: Optional[threading.Thread] = None
@@ -408,10 +411,21 @@ class FFmpegStreamOutput(StreamOutput):
             "-s", f"{self.width}x{self.height}",
             "-r", str(self.fps),
             "-thread_queue_size", "512",
-            "-i", "-",  # Read from stdin
-            "-c:v", use_encoder,
+            "-i", "-",  # Read video frames from stdin
         ]
+        # Optional audio passthrough from a local media file (muxed into the
+        # output container).  Map video from stdin (0:v) and audio from the
+        # media file (1:a, optional so files without audio don't fail).
+        if self.audio_source:
+            cmd += ["-i", self.audio_source]
+        cmd += ["-map", "0:v:0"]
+        if self.audio_source:
+            cmd += ["-map", "1:a:0?"]
+        cmd += ["-c:v", use_encoder]
         cmd.extend(encoder_options)
+        if self.audio_source:
+            # AAC is the safe choice for both FLV (RTMP) and MP4 containers
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
         # Determine output container format
         if self.url.startswith("rtmp://"):
             out_format = ["-f", "flv"]
@@ -421,6 +435,11 @@ class FFmpegStreamOutput(StreamOutput):
             # Local file: let FFmpeg auto-detect from file extension
             out_format = []
 
+        # NOTE: no -shortest. With video written via a raw stdin pipe the
+        # video stream can end before audio (e.g. early shutdown) and the MP4
+        # muxer then DROPS the audio stream entirely under -shortest. Without
+        # it, video/audio of equal length mux cleanly and a short early-stop
+        # only leaves an audio tail.
         cmd.extend([
             "-pix_fmt", "yuv420p",
             "-g", str(self.fps * 2),  # Keyframe every 2 seconds
@@ -431,14 +450,14 @@ class FFmpegStreamOutput(StreamOutput):
 
         try:
             self.process = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
-                bufsize=10*1024*1024  # 10MB buffer for large frames
+                cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
             # Start stderr reader thread to prevent pipe deadlock
             self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
             self._stderr_thread.start()
             print(f"[STREAMING] FFmpeg output started -> {self.url}")
-            print(f"[STREAMING]   Encoder: {use_encoder}, {self.width}x{self.height}@{self.fps}fps")
+            print(f"[STREAMING]   Encoder: {use_encoder}, {self.width}x{self.height}@{self.fps}fps"
+                  + (f" + audio from {self.audio_source}" if self.audio_source else ""))
             return True
         except Exception as e:
             print(f"[STREAMING] Failed to start FFmpeg output: {e}")
@@ -521,20 +540,97 @@ class PipeOutput(StreamOutput):
             self._fifo_fd = None
 
 
+class VirtualCamOutput(StreamOutput):
+    """Pushes processed frames to a virtual camera (OBS Virtual Camera).
+
+    Lets you use the swapped feed as a normal webcam in WhatsApp, Telegram,
+    Zoom, etc. without running OBS or routing through RTMP/ngrok — the
+    lowest-latency path when the webcam and the machine doing the swap are
+    the same computer (Phase 2).
+
+    Requirements:
+        pip install pyvirtualcam
+        Windows: OBS Studio installed (provides the "OBS Virtual Camera"
+                 capture driver).
+        Linux:   v4l2loopback kernel module (modprobe v4l2loopback).
+    """
+
+    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30,
+                 camera_name: Optional[str] = None):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.camera_name = camera_name
+        self._cam = None
+        self._pyvirtualcam = None
+
+    def start(self) -> bool:
+        try:
+            import pyvirtualcam
+        except ImportError:
+            print("[STREAMING] pyvirtualcam not installed. Run: pip install pyvirtualcam")
+            return False
+        self._pyvirtualcam = pyvirtualcam
+        try:
+            self._cam = pyvirtualcam.Camera(
+                self.width, self.height, self.fps,
+                fmt=pyvirtualcam.PixelFormat.RGB,
+                device=self.camera_name or None,
+            )
+            print(f"[STREAMING] Virtual camera started: {self._cam.device} "
+                  f"{self.width}x{self.height}@{self.fps}fps")
+            return True
+        except Exception as e:
+            print(f"[STREAMING] Virtual camera failed to start: {e}")
+            print("[STREAMING]   Windows: install OBS Studio (Virtual Camera driver).")
+            print("[STREAMING]   Linux:   modprobe v4l2loopback (needs root).")
+            self._cam = None
+            return False
+
+    def write(self, frame: np.ndarray) -> bool:
+        if self._cam is None:
+            return False
+        try:
+            # pyvirtualcam expects RGB24 (our frames are BGR)
+            self._cam.send(frame[:, :, ::-1])
+            # Pace output to the requested frame rate
+            self._cam.sleep_until_next_frame()
+            return True
+        except Exception as e:
+            print(f"[STREAMING] Virtual camera write error: {e}")
+            return False
+
+    def close(self) -> None:
+        if self._cam is not None:
+            try:
+                self._cam.close()
+            except Exception:
+                pass
+            self._cam = None
+
+
 def create_output(url: str, width: int = 1280, height: int = 720,
-                  fps: int = 30, encoder: str = "libx264", quality: int = 23) -> StreamOutput:
+                  fps: int = 30, encoder: str = "libx264", quality: int = 23,
+                  audio_source: Optional[str] = None) -> StreamOutput:
     """Factory: create appropriate StreamOutput from a URL string.
 
     Args:
         url: One of:
+            - "virtualcam" / "virtualcam:NAME" / "pyvirtualcam" -> virtual camera
             - "rtmp://..." -> FFmpeg RTMP stream
             - "udp://..." -> FFmpeg UDP stream
             - "pipe:/path/to/fifo" -> named pipe output
             - "/path/to/file.mp4" -> file recording
     """
-    if url.lower().startswith("pipe:"):
+    low = url.lower()
+    if low.startswith(("virtualcam", "pyvirtualcam", "vcam")):
+        name = None
+        if ":" in url:
+            name = url.split(":", 1)[1].strip() or None
+        return VirtualCamOutput(width, height, fps, camera_name=name)
+    if low.startswith("pipe:"):
         return PipeOutput(url[5:], width, height)
-    return FFmpegStreamOutput(url, width, height, fps, encoder, quality)
+    return FFmpegStreamOutput(url, width, height, fps, encoder, quality, audio_source=audio_source)
 
 
 # ---------------------------------------------------------------------------

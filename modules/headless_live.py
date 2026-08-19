@@ -10,6 +10,8 @@ No Tkinter, no OpenCV GUI, no display server required. Designed for cloud
 GPU environments and streaming workflows.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import cv2
@@ -17,7 +19,6 @@ import numpy as np
 import time
 import queue
 import threading
-from typing import Optional, Callable, List
 
 import modules.globals
 from modules.face_analyser import (
@@ -25,7 +26,10 @@ from modules.face_analyser import (
     get_many_faces,
     detect_one_face_fast,
     detect_many_faces_fast,
+    get_one_face_lite,
+    get_many_faces_lite,
     get_face_analyser,
+    _needs_landmark,
 )
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.streaming import (
@@ -34,14 +38,17 @@ from modules.streaming import (
     CameraSource, VideoFileSource, PipeSource, FFmpegInputSource,
     FFmpegStreamOutput, PipeOutput,
 )
-from modules.processors.frame.face_masking import (
-    create_lower_mouth_mask,
-    create_eyes_mask,
-    create_eyebrows_mask,
-    create_face_mask,
-    apply_mask_area,
-)
 from modules.gpu_processing import gpu_flip
+
+
+def _reset_interpolation_state() -> None:
+    """Reset face-swapper interpolation state from previous runs."""
+    try:
+        from modules.processors.frame import face_swapper
+        if hasattr(face_swapper, 'PREVIOUS_FRAME_RESULT'):
+            face_swapper.PREVIOUS_FRAME_RESULT = None
+    except Exception:
+        pass  # Non-fatal — processor may not be loaded
 
 
 class HeadlessLivePipeline:
@@ -115,18 +122,44 @@ class HeadlessLivePipeline:
 
         This is the extracted frame-processing pipeline from ui.py's
         _processing_thread_func, adapted for headless operation.
+
+        Phase 1 pipeline upgrades:
+          - Resolution decoupling: frames are downscaled to
+            process_width/process_height before detection+swap+enhance,
+            then upscaled to the output size afterwards (FACELESS-style
+            480p sweet spot, ~3x cheaper than processing at 1080p).
+          - Per-frame detection: at reduced resolution RetinaFace costs
+            ~3-6ms on GPU, so the swap bbox no longer lags head motion.
+          - Landmark-aware detection: masks and enhancers need
+            landmark_2d_106, which detection-only faces never carried —
+            masks silently no-op'd before.  `get_*_faces_lite` runs
+            detection + landmarks but skips recognition (~1-2ms saved).
+          - Feature-preservation masks are applied INSIDE swap_face via
+            face_masking.py (single source of truth) — the old in-loop
+            mask code was removed (it also mutated the global mask sizes
+            every frame, ballooning the masks to 100 within seconds).
         """
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
         last_source_path = None
         prev_time = time.time()
         frame_count = 0
         fps = 0.0
-        det_count = 0
-        cached_target_face = None
-        cached_many_faces = None
+        need_landmarks = _needs_landmark()
 
-        # Detect every N frames (~80ms interval)
-        det_interval = max(1, round(camera_fps * 0.08))
+        # Output target size (upscale step destination)
+        out_w = modules.globals.stream_width
+        out_h = modules.globals.stream_height
+        # Phase 3 adaptive resolution state: processing dims are
+        # base_w/base_h * adaptive_scale, with the scale auto-tuned to
+        # hold the stream fps budget when --adaptive-resolution is on.
+        adaptive = modules.globals.adaptive_resolution
+        base_w = modules.globals.process_width
+        base_h = modules.globals.process_height
+        base_known = base_w > 0 and base_h > 0
+        scale = max(0.4, min(1.0, getattr(modules.globals, 'adaptive_scale', 1.0)))
+        ema_frame_ms: float | None = None
+        adaptive_counter = 0
+        fps_budget = 1000.0 / max(1, modules.globals.stream_fps)
 
         while not self.stop_event.is_set():
             try:
@@ -134,10 +167,33 @@ class HeadlessLivePipeline:
             except queue.Empty:
                 continue
 
+            t0 = time.time()
             temp_frame = frame
 
             if modules.globals.live_mirror:
                 temp_frame = gpu_flip(temp_frame, 1)
+
+            # ---- Resolution decoupling: downscale before processing ----
+            original_size = (temp_frame.shape[1], temp_frame.shape[0])
+            if not base_known:
+                # Auto: cap processing resolution at 854x480 (FACELESS
+                # sweet spot); keep native size if input is already smaller.
+                auto_w, auto_h = 854, 480
+                if original_size[0] > auto_w or original_size[1] > auto_h:
+                    auto_scale = min(auto_w / original_size[0], auto_h / original_size[1])
+                    base_w = max(1, int(original_size[0] * auto_scale))
+                    base_h = max(1, int(original_size[1] * auto_scale))
+                else:
+                    base_w, base_h = original_size
+                base_known = True
+            p_w = max(1, int(base_w * scale))
+            p_h = max(1, int(base_h * scale))
+            if original_size[0] > p_w or original_size[1] > p_h:
+                resize_scale = min(p_w / original_size[0], p_h / original_size[1])
+                new_size = (max(1, int(original_size[0] * resize_scale)),
+                            max(1, int(original_size[1] * resize_scale)))
+                temp_frame = cv2.resize(temp_frame, new_size,
+                                        interpolation=cv2.INTER_AREA)
 
             # Re-load source face if path changed
             if modules.globals.source_path and modules.globals.source_path != last_source_path:
@@ -146,15 +202,19 @@ class HeadlessLivePipeline:
                 if self.source_face is None:
                     print("[HEADLESS] Warning: No face detected in source image")
 
-            # ---- Face detection (throttled) ----
-            det_count += 1
-            if det_count % det_interval == 0:
-                if modules.globals.many_faces:
-                    cached_target_face = None
+            # ---- Face detection (every frame, landmark-aware) ----
+            if modules.globals.many_faces:
+                if need_landmarks:
+                    cached_many_faces = get_many_faces_lite(temp_frame, need_landmark=True)
+                else:
                     cached_many_faces = detect_many_faces_fast(temp_frame)
+                cached_target_face = None
+            else:
+                if need_landmarks:
+                    cached_target_face = get_one_face_lite(temp_frame, need_landmark=True)
                 else:
                     cached_target_face = detect_one_face_fast(temp_frame)
-                    cached_many_faces = None
+                cached_many_faces = None
 
             # Build face list for enhancers
             _cached_faces = None
@@ -166,67 +226,56 @@ class HeadlessLivePipeline:
             # ---- Run frame processors ----
             for frame_processor in frame_processors:
                 try:
-                    if frame_processor.NAME == "DLC.FACE-ENHANCER":
-                        if modules.globals.fp_ui.get("face_enhancer", False):
-                            temp_frame = frame_processor.process_frame(
-                                None, temp_frame, detected_faces=_cached_faces)
-
-                    elif frame_processor.NAME == "DLC.FACE-ENHANCER-GPEN256":
-                        if modules.globals.fp_ui.get("face_enhancer_gpen256", False):
-                            temp_frame = frame_processor.process_frame(
-                                None, temp_frame, detected_faces=_cached_faces)
-
-                    elif frame_processor.NAME == "DLC.FACE-ENHANCER-GPEN512":
-                        if modules.globals.fp_ui.get("face_enhancer_gpen512", False):
-                            temp_frame = frame_processor.process_frame(
-                                None, temp_frame, detected_faces=_cached_faces)
-
-                    elif frame_processor.NAME == "DLC.FACE-SWAPPER":
+                    if frame_processor.NAME == "DLC.FACE-SWAPPER":
                         swapped_bboxes = []
                         _all_faces = cached_many_faces if (modules.globals.many_faces and cached_many_faces) else ([cached_target_face] if cached_target_face else [])
 
                         for t_face in _all_faces:
-                            # --- Face Masking (2.7+): Preserve natural features ---
-                            original_frame = temp_frame.copy()
-
-                            # Mouth mask: preserve original lip movement
-                            if modules.globals.mouth_mask or modules.globals.mouth_mask_size > 0:
-                                mouth_mask, mouth_cutout, mouth_box, mouth_polygon = create_lower_mouth_mask(t_face, temp_frame)
-                                modules.globals.mouth_mask_size = min(100, modules.globals.mouth_mask_size + 30)
-
-                            # Eyes mask: preserve original eye movement/blinks
-                            if modules.globals.eyes_mask or modules.globals.eyes_mask_size > 0:
-                                eyes_mask, eyes_cutout, eyes_box, eyes_polygon = create_eyes_mask(t_face, temp_frame)
-                                modules.globals.eyes_mask_size = min(100, modules.globals.eyes_mask_size + 15)
-
-                            # Eyebrows mask: preserve original eyebrow expressions
-                            if modules.globals.eyebrows_mask or modules.globals.eyebrows_mask_size > 0:
-                                eyebrows_mask, eyebrows_cutout, eyebrows_box, eyebrows_polygon = create_eyebrows_mask(t_face, temp_frame)
-                                modules.globals.eyebrows_mask_size = min(100, modules.globals.eyebrows_mask_size + 25)
-
-                            # Perform face swap
+                            # Feature-preservation masks (mouth/eyes/eyebrows)
+                            # are applied inside swap_face via face_masking.py
                             temp_frame = frame_processor.swap_face(self.source_face, t_face, temp_frame)
                             if hasattr(t_face, 'bbox') and t_face.bbox is not None:
                                 swapped_bboxes.append(t_face.bbox.astype(int))
-
-                            # --- Apply masks to restore original features ---
-                            face_mask = create_face_mask(t_face, temp_frame)
-
-                            if (modules.globals.mouth_mask or modules.globals.mouth_mask_size > 0) and mouth_cutout is not None:
-                                temp_frame = apply_mask_area(temp_frame, mouth_cutout, mouth_box, face_mask, mouth_polygon)
-                            if (modules.globals.eyes_mask or modules.globals.eyes_mask_size > 0) and eyes_cutout is not None:
-                                temp_frame = apply_mask_area(temp_frame, eyes_cutout, eyes_box, face_mask, eyes_polygon)
-                            if (modules.globals.eyebrows_mask or modules.globals.eyebrows_mask_size > 0) and eyebrows_cutout is not None:
-                                temp_frame = apply_mask_area(temp_frame, eyebrows_cutout, eyebrows_box, face_mask, eyebrows_polygon)
 
                         # Post-processing (sharpening, interpolation)
                         temp_frame = frame_processor.apply_post_processing(temp_frame, swapped_bboxes)
 
                     else:
-                        temp_frame = frame_processor.process_frame(self.source_face, temp_frame)
+                        temp_frame = frame_processor.process_frame(
+                            self.source_face, temp_frame, detected_faces=_cached_faces)
 
                 except Exception as e:
                     print(f"[HEADLESS] Processor {frame_processor.NAME} error: {e}")
+
+            # ---- Phase 3: adaptive resolution control ----
+            # EMA of per-frame processing time; degrade the processing
+            # scale (in 0.75 steps, min 0.4) when we exceed 85% of the
+            # frame budget, restore it when we drop below 55% (hysteresis
+            # prevents oscillation). Detect/swap/enhance then run at the
+            # reduced size and the result is still upscaled to output.
+            if adaptive:
+                dt_ms = (time.time() - t0) * 1000.0
+                ema_frame_ms = dt_ms if ema_frame_ms is None else 0.9 * ema_frame_ms + 0.1 * dt_ms
+                adaptive_counter += 1
+                if adaptive_counter >= 15:
+                    adaptive_counter = 0
+                    modules.globals.adaptive_scale = scale
+                    if ema_frame_ms > 0.85 * fps_budget and scale > 0.4:
+                        scale = max(0.4, round(scale * 0.75, 3))
+                        print(f"[HEADLESS] Adaptive: degrading processing resolution to {p_w}x{p_h} "
+                              f"(frame {ema_frame_ms:.0f}ms > budget {fps_budget:.0f}ms)")
+                    elif ema_frame_ms < 0.55 * fps_budget and scale < 1.0:
+                        scale = min(1.0, round(scale / 0.75, 3))
+                        print(f"[HEADLESS] Adaptive: restoring processing resolution to "
+                              f"{int(base_w * scale)}x{int(base_h * scale)} (frame {ema_frame_ms:.0f}ms)")
+                    self.stats['adaptive_scale'] = scale
+                    self.stats['process_resolution'] = f"{p_w}x{p_h}"
+
+            # ---- Upscale back to output resolution ----
+            target_size = (out_w, out_h) if modules.globals.stream_output else original_size
+            if temp_frame.shape[1] != target_size[0] or temp_frame.shape[0] != target_size[1]:
+                temp_frame = cv2.resize(temp_frame, target_size,
+                                        interpolation=cv2.INTER_LINEAR)
 
             # ---- FPS calculation ----
             current_time = time.time()
@@ -260,17 +309,33 @@ class HeadlessLivePipeline:
     # Stage 3: Output thread
     # ------------------------------------------------------------------
     def _output_loop(self):
-        """Write processed frames to the output stream."""
+        """Write processed frames to the output stream. Auto-restart FFmpeg if it crashes."""
+        restart_count = 0
         while not self.stop_event.is_set():
             try:
                 frame = self.processed_queue.get(timeout=0.05)
             except queue.Empty:
+                # Check if FFmpeg died and restart it
+                if self.output and hasattr(self.output, 'process') and self.output.process:
+                    if self.output.process.poll() is not None and restart_count < 10:
+                        print(f"[HEADLESS] FFmpeg died, restarting... (attempt {restart_count + 1})")
+                        try:
+                            self.output.close()
+                        except Exception:
+                            pass
+                        if self.output.start():
+                            restart_count += 1
+                            print("[HEADLESS] FFmpeg restarted successfully")
+                        else:
+                            print("[HEADLESS] FFmpeg restart failed")
+                            self.output = None
                 continue
 
             if self.output:
                 success = self.output.write(frame)
                 if success:
                     self.stats["frames_written"] += 1
+                    restart_count = 0  # Reset counter on successful write
 
     # ------------------------------------------------------------------
     # Public API
@@ -340,9 +405,7 @@ class HeadlessLivePipeline:
         print("[HEADLESS] Source face loaded successfully")
 
         # Reset interpolation state from previous runs
-        from modules.processors.frame import face_swapper
-        if hasattr(face_swapper, 'PREVIOUS_FRAME_RESULT'):
-            face_swapper.PREVIOUS_FRAME_RESULT = None
+        _reset_interpolation_state()
 
         # Initialize frame processors
         self.frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
@@ -387,6 +450,19 @@ class HeadlessLivePipeline:
         # Create output if configured
         if modules.globals.stream_output:
             print(f"[HEADLESS] Initializing stream output: {modules.globals.stream_output}")
+
+            # Audio passthrough: auto-detect for local video file inputs, or use
+            # an explicit --stream-audio-source. Virtual camera output carries no
+            # audio (the OS mic is used directly), so skip wiring it there.
+            audio_source = modules.globals.stream_audio_source
+            if not audio_source and not str(modules.globals.stream_output).lower().startswith(("virtualcam", "pyvirtualcam", "vcam")):
+                src = modules.globals.input_source or ""
+                if src.lower().startswith("file:"):
+                    src = src[5:]
+                if os.path.isfile(src) and src.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".wmv")):
+                    audio_source = src
+                    print(f"[HEADLESS] Auto-wiring audio passthrough from: {audio_source}")
+
             self.output = create_output(
                 modules.globals.stream_output,
                 width=modules.globals.stream_width,
@@ -394,6 +470,7 @@ class HeadlessLivePipeline:
                 fps=modules.globals.stream_fps,
                 encoder=modules.globals.stream_encoder,
                 quality=modules.globals.stream_quality,
+                audio_source=audio_source,
             )
             if not self.output.start():
                 print("[HEADLESS] WARNING: Stream output failed to start, continuing without output")
@@ -459,9 +536,7 @@ class HeadlessLivePipeline:
             self.output.close()
 
         # Reset interpolation state
-        from modules.processors.frame import face_swapper
-        if hasattr(face_swapper, 'PREVIOUS_FRAME_RESULT'):
-            face_swapper.PREVIOUS_FRAME_RESULT = None
+        _reset_interpolation_state()
 
         elapsed = time.time() - self.stats["start_time"]
         print(f"\n[HEADLESS] Pipeline stopped. Total time: {elapsed:.1f}s")

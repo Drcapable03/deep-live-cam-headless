@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 # single thread doubles cuda performance - needs to be set before torch import
@@ -6,7 +8,6 @@ if any(arg.startswith('--execution-provider') for arg in sys.argv):
 # reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
-from typing import List
 import platform
 import signal
 import shutil
@@ -46,7 +47,7 @@ if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
 
 warnings.filterwarnings('ignore', category=FutureWarning, module='insightface')
-if HAS_TORCH:
+if HAS_TORCH and 'ROCMExecutionProvider' not in modules.globals.execution_providers:
     warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
 
 
@@ -87,6 +88,15 @@ def parse_args() -> None:
     program.add_argument('--stream-fps', help='Output stream frame rate', dest='stream_fps', type=int, default=30)
     program.add_argument('--stream-quality', help='Stream quality (CRF for x264/x265, CQ for NVENC)', dest='stream_quality', type=int, default=23)
     program.add_argument('--stream-encoder', help='Stream video encoder', dest='stream_encoder', default='libx264', choices=['libx264', 'libx265', 'h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf'])
+    program.add_argument('--process-width', help='Processing resolution width for resolution decoupling (0=auto: capped at 854x480)', dest='process_width', type=int, default=0)
+    program.add_argument('--process-height', help='Processing resolution height for resolution decoupling (0=auto: capped at 854x480)', dest='process_height', type=int, default=0)
+    program.add_argument('--virtual-cam-name', help='Virtual camera device name for --stream-output virtualcam (optional)', dest='virtual_cam_name', default=None)
+    program.add_argument('--stream-audio-source', help='Audio source file to mux into stream/file output (auto-detected for local video inputs)', dest='stream_audio_source', default=None)
+    program.add_argument('--no-fp16', help='Disable FP16 models on CUDA Tensor-Core GPUs (fall back to FP32)', dest='no_fp16', action='store_true', default=False)
+    program.add_argument('--blend-opacity', help='Blend swapped face over original: 0.0-1.0 (1.0 = full swap, 0.85 recommended)', dest='blend_opacity', type=float, default=None)
+    program.add_argument('--sharpen-strength', help='Unsharp sharpening strength on swapped faces: 0.0-1.0+ (0.4 recommended)', dest='sharpen_strength', type=float, default=None)
+    program.add_argument('--quality-preset', help='Bundled defaults: normal (balanced, current defaults) or high (540p processing + gpen256 + sharpen 0.4 + opacity 0.9)', dest='quality_preset', default='normal', choices=['normal', 'high'])
+    program.add_argument('--adaptive-resolution', help='Automatically degrade/restore processing resolution to hold --stream-fps under GPU load', dest='adaptive_resolution', action='store_true', default=False)
     program.add_argument('--headless', help='Force headless mode (no GUI)', dest='force_headless', action='store_true', default=False)
     # === END: Headless Streaming Arguments ===
 
@@ -132,10 +142,39 @@ def parse_args() -> None:
     modules.globals.stream_fps = args.stream_fps
     modules.globals.stream_quality = args.stream_quality
     modules.globals.stream_encoder = args.stream_encoder
+    modules.globals.process_width = args.process_width
+    modules.globals.process_height = args.process_height
+    modules.globals.virtual_cam_name = args.virtual_cam_name
+    modules.globals.stream_audio_source = args.stream_audio_source
+
+    # Phase 3: FP16, post-processing, quality presets, adaptive resolution
+    modules.globals.fp16 = not args.no_fp16
+    modules.globals.quality_preset = args.quality_preset
+    modules.globals.adaptive_resolution = args.adaptive_resolution
+    modules.globals.adaptive_scale = 1.0
+
+    # Quality preset 'high' bundles sharper defaults (FACELESS-style).
+    # Explicit CLI flags always win over preset defaults.
+    if args.quality_preset == 'high':
+        if args.process_width == 0 and args.process_height == 0:
+            modules.globals.process_width = 960
+            modules.globals.process_height = 540
+        if args.frame_processor == ['face_swapper']:
+            modules.globals.frame_processors = ['face_swapper', 'face_enhancer_gpen256']
+        if args.blend_opacity is None:
+            modules.globals.blend_opacity = 0.9
+        if args.sharpen_strength is None:
+            modules.globals.sharpen_strength = 0.4
+    if args.blend_opacity is not None:
+        modules.globals.blend_opacity = args.blend_opacity
+    if args.sharpen_strength is not None:
+        modules.globals.sharpen_strength = args.sharpen_strength
+    modules.globals.opacity = modules.globals.blend_opacity
+    modules.globals.sharpness = modules.globals.sharpen_strength
 
     #for ENHANCER tumblers:
     for enhancer_key in ('face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'):
-        modules.globals.fp_ui[enhancer_key] = enhancer_key in args.frame_processor
+        modules.globals.fp_ui[enhancer_key] = enhancer_key in modules.globals.frame_processors
 
     # translate deprecated args
     if args.source_path_deprecated:
@@ -214,8 +253,6 @@ def limit_resources() -> None:
     # limit memory usage
     if modules.globals.max_memory:
         memory = modules.globals.max_memory * 1024 ** 3
-        if platform.system().lower() == 'darwin':
-            memory = modules.globals.max_memory * 1024 ** 6
         if platform.system().lower() == 'windows':
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -244,6 +281,7 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     print(f'[{scope}] {message}')
     if not modules.globals.headless and ui is not None:
         ui.update_status(message)
+
 
 def start() -> None:
     """Start processing with performance monitoring."""
@@ -316,7 +354,9 @@ def start() -> None:
         if not modules.globals.map_faces:
             create_temp(modules.globals.target_path)
             update_status('Extracting frames...')
-            extract_frames(modules.globals.target_path)
+            if not extract_frames(modules.globals.target_path):
+                update_status('ERROR: Frame extraction failed.')
+                return False
         extraction_time = time.time() - extraction_start
 
         temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
@@ -376,7 +416,8 @@ def run() -> None:
         return
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_check():
-            return
+            print(f'[DLC.CORE] Warning: {frame_processor.NAME} pre_check failed, skipping this processor')
+            continue
     limit_resources()
 
     # === START: Headless Live Streaming Mode ===
