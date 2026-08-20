@@ -41,6 +41,22 @@ step() {
 # Check if a command exists
 cmd_exists() { command -v "$1" &>/dev/null; }
 
+# Detect whether systemd is usable (Vast.ai / Docker containers have NO
+# systemd — systemctl fails there). Fall back to nohup background processes.
+SYSTEMD_AVAILABLE=false
+if cmd_exists systemctl && [ -d /run/systemd/system ]; then
+    SYSTEMD_AVAILABLE=true
+fi
+
+# Start a background service with nohup + save PID (container-safe fallback)
+start_bg() {
+    local name="$1"; shift
+    local pidfile="/workspace/logs/${name}.pid"
+    nohup "$@" >>"/workspace/logs/${name}.log" 2>&1 &
+    echo $! > "${pidfile}"
+    ok "${name} started in background (PID $(cat ${pidfile}))"
+}
+
 # Get installed CUDA driver version from nvidia-smi
 get_driver_version() {
     nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '
@@ -445,11 +461,12 @@ EOF
     ok "MediaMTX config created at ${MEDIAMTX_CONF}"
 fi
 
-# Create systemd service for MediaMTX
-SYSTEMD_UNIT="/etc/systemd/system/mediamtx.service"
-if [ ! -f "${SYSTEMD_UNIT}" ]; then
-    log "Creating MediaMTX systemd service..."
-    cat > "${SYSTEMD_UNIT}" <<EOF
+# Create systemd service OR a nohup start script (container-safe)
+if [ "${SYSTEMD_AVAILABLE}" = "true" ]; then
+    SYSTEMD_UNIT="/etc/systemd/system/mediamtx.service"
+    if [ ! -f "${SYSTEMD_UNIT}" ]; then
+        log "Creating MediaMTX systemd service..."
+        cat > "${SYSTEMD_UNIT}" <<EOF
 [Unit]
 Description=MediaMTX RTMP Server
 After=network.target
@@ -464,16 +481,31 @@ Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda-12.6/targe
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable mediamtx
-    ok "MediaMTX systemd service created"
-fi
+        systemctl daemon-reload
+        systemctl enable mediamtx
+        ok "MediaMTX systemd service created"
+    fi
 
-# Start MediaMTX
-if ! systemctl is-active --quiet mediamtx 2>/dev/null; then
-    log "Starting MediaMTX..."
-    systemctl start mediamtx || "${MEDIAMTX_BIN}" --config "${MEDIAMTX_CONF}" &
-    sleep 2
+    if ! systemctl is-active --quiet mediamtx 2>/dev/null; then
+        log "Starting MediaMTX via systemd..."
+        systemctl start mediamtx
+        sleep 2
+    fi
+else
+    # Container mode: write a start script + launch in background
+    if [ ! -f /workspace/start_mediamtx.sh ]; then
+        cat > /workspace/start_mediamtx.sh <<EOF
+#!/bin/bash
+exec ${MEDIAMTX_BIN} --config ${MEDIAMTX_CONF}
+EOF
+        chmod +x /workspace/start_mediamtx.sh
+        ok "Created /workspace/start_mediamtx.sh"
+    fi
+    if [ ! -f /workspace/logs/mediamtx.pid ] || ! kill -0 "$(cat /workspace/logs/mediamtx.pid 2>/dev/null)" 2>/dev/null; then
+        log "Starting MediaMTX in background (container mode)..."
+        start_bg mediamtx "${MEDIAMTX_BIN}" --config "${MEDIAMTX_CONF}"
+        sleep 2
+    fi
 fi
 
 # Verify port 1935
@@ -521,11 +553,12 @@ else
     ok "ngrok config already exists"
 fi
 
-# Create optional systemd service for ngrok tunnel
-NGROK_SERVICE="/etc/systemd/system/ngrok-tunnel.service"
-if [ ! -f "${NGROK_SERVICE}" ]; then
-    log "Creating ngrok tunnel systemd service (disabled by default — edit to enable)..."
-    cat > "${NGROK_SERVICE}" <<EOF
+# Optional tunnel: systemd service (VM) or nohup script (container)
+if [ "${SYSTEMD_AVAILABLE}" = "true" ]; then
+    NGROK_SERVICE="/etc/systemd/system/ngrok-tunnel.service"
+    if [ ! -f "${NGROK_SERVICE}" ]; then
+        log "Creating ngrok tunnel systemd service (disabled by default — edit to enable)..."
+        cat > "${NGROK_SERVICE}" <<EOF
 [Unit]
 Description=ngrok TCP tunnel for MediaMTX (port 1935)
 After=network.target mediamtx.service
@@ -540,8 +573,18 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl disable ngrok-tunnel 2>/dev/null || true
-    ok "ngrok tunnel service created (not enabled — edit as needed)"
+        systemctl disable ngrok-tunnel 2>/dev/null || true
+        ok "ngrok tunnel service created (not enabled — edit as needed)"
+    fi
+else
+    if [ ! -f /workspace/start_ngrok_tunnel.sh ]; then
+        cat > /workspace/start_ngrok_tunnel.sh <<EOF
+#!/bin/bash
+exec ${NGROK_BIN} tcp 1935
+EOF
+        chmod +x /workspace/start_ngrok_tunnel.sh
+        ok "Created /workspace/start_ngrok_tunnel.sh (run manually: nohup /workspace/start_ngrok_tunnel.sh &)"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -549,10 +592,11 @@ fi
 # ---------------------------------------------------------------------------
 step "Project Files"
 
-# Clone/pull project
+# Clone/pull project (the fork with Phases 1-4 implemented)
+REPO_URL="https://github.com/Drcapable03/deep-live-cam-headless.git"
 if [ ! -d "${PROJECT_DIR}" ]; then
     log "Cloning deep-live-cam-headless to ${PROJECT_DIR}..."
-    git clone https://github.com/hacksider/deep-live-cam-headless.git "${PROJECT_DIR}" 2>&1 | tail -3
+    git clone "${REPO_URL}" "${PROJECT_DIR}" 2>&1 | tail -3
     ok "Project cloned"
 else
     log "Project already exists — pulling latest changes..."
@@ -573,8 +617,17 @@ fi
 log "Running smoke test with CPU provider..."
 cd "${PROJECT_DIR}"
 source "${VENV_DIR}/bin/activate"
-python3 run_headless.py -s face.jpg --input-source smoke_input.mp4 --stream-output /tmp/smoke_test.mp4 \
-    --execution-provider cpu --frames 3 2>&1 | tail -10 || warn "Smoke test had issues (may need valid input video)"
+# Prefer the dedicated smoke test; fall back to a plain headless run if
+# smoke_input.mp4 is missing (it's generated by smoke_test.py).
+if [ -f "${PROJECT_DIR}/smoke_test.py" ] && [ -f "${PROJECT_DIR}/smoke_input.mp4" ]; then
+    python3 smoke_test.py -s face.jpg -t smoke_input.mp4 --provider cpu --frames 3 2>&1 | tail -15 || \
+        warn "Smoke test had issues (non-fatal; check output)"
+else
+    python3 run_headless.py -s face.jpg --input-source smoke_input.mp4 \
+        --stream-output /tmp/smoke_test.mp4 --execution-provider cpu \
+        --frame-processor face_swapper 2>&1 | tail -10 || \
+        warn "Smoke test had issues (may need valid input video)"
+fi
 cd /
 ok "Smoke test complete"
 

@@ -27,3 +27,7 @@ faceswap/
 switch_states.json
 /models
 install.bat
+
+# Generated test artifacts (smoke_test.py outputs)
+smoke_report.txt
+smoke_out*.mp4
